@@ -228,6 +228,7 @@ class DownmixFoldDataTest : public ::testing::TestWithParam<DownmixDataTestParam
     }
 
     void SetUp() override {
+        SKIP_TEST_IF_DATA_UNSUPPORTED(mDescriptor.common.flags);
         SetUpDownmix(mInputChannelLayout);
         if (!isLayoutValid(mInputChannelLayout)) {
             GTEST_SKIP() << "Layout not supported \n";
@@ -235,7 +236,10 @@ class DownmixFoldDataTest : public ::testing::TestWithParam<DownmixDataTestParam
         setDataTestParams(mInputChannelLayout);
     }
 
-    void TearDown() override { TearDownDownmix(); }
+    void TearDown() override {
+        SKIP_TEST_IF_DATA_UNSUPPORTED(mDescriptor.common.flags);
+        TearDownDownmix();
+    }
 
     void checkAtLeft(int32_t position) {
         for (size_t i = 0, j = position; i < mOutputBufferSize;

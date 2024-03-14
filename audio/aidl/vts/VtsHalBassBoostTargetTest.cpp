@@ -129,8 +129,152 @@ class BassBoostParamTest : public ::testing::TestWithParam<BassBoostParamTestPar
 };
 
 TEST_P(BassBoostParamTest, SetAndGetStrength) {
-    EXPECT_NO_FATAL_FAILURE(addStrengthParam(mParamStrength));
-    SetAndGetBassBoostParameters();
+    if (isStrengthValid(mParamStrength)) {
+        ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(mParamStrength, EX_NONE));
+    } else {
+        ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(mParamStrength, EX_ILLEGAL_ARGUMENT));
+    }
+}
+
+enum DataParamName { DATA_INSTANCE_NAME, DATA_LAYOUT };
+
+using BassBoostDataTestParam =
+        std::tuple<std::pair<std::shared_ptr<IFactory>, Descriptor>, int32_t>;
+
+class BassBoostDataTest : public ::testing::TestWithParam<BassBoostDataTestParam>,
+                          public BassBoostEffectHelper {
+  public:
+    BassBoostDataTest() : mChannelLayout(std::get<DATA_LAYOUT>(GetParam())) {
+        std::tie(mFactory, mDescriptor) = std::get<DATA_INSTANCE_NAME>(GetParam());
+        mStrengthValues = getTestValueSet<BassBoost, int, Range::bassBoost, BassBoost::strengthPm>(
+                {std::get<DATA_INSTANCE_NAME>(GetParam())}, expandTestValueBasic<int>);
+    }
+
+    void SetUp() override {
+        SKIP_TEST_IF_DATA_UNSUPPORTED(mDescriptor.common.flags);
+        ASSERT_NO_FATAL_FAILURE(SetUpBassBoost(mChannelLayout));
+        if (int32_t version;
+            mEffect->getInterfaceVersion(&version).isOk() && version < kMinDataTestHalVersion) {
+            GTEST_SKIP() << "Skipping the data test for version: " << version << "\n";
+        }
+    }
+
+    void TearDown() override {
+        SKIP_TEST_IF_DATA_UNSUPPORTED(mDescriptor.common.flags);
+        TearDownBassBoost();
+    }
+
+    // Find FFT bin indices for testFrequencies and get bin center frequencies
+    void roundToFreqCenteredToFftBin(std::vector<int>& testFrequencies,
+                                     std::vector<int>& binOffsets) {
+        for (size_t i = 0; i < testFrequencies.size(); i++) {
+            binOffsets[i] = std::round(testFrequencies[i] / kBinWidth);
+            testFrequencies[i] = std::round(binOffsets[i] * kBinWidth);
+        }
+    }
+
+    // Generate multitone input between -1 to +1 using testFrequencies
+    void generateMultiTone(const std::vector<int>& testFrequencies, std::vector<float>& input) {
+        for (auto i = 0; i < kInputSize; i++) {
+            input[i] = 0;
+
+            for (size_t j = 0; j < testFrequencies.size(); j++) {
+                input[i] += sin(2 * M_PI * testFrequencies[j] * i / kSamplingFrequency);
+            }
+            input[i] /= testFrequencies.size();
+        }
+    }
+
+    // Use FFT transform to convert the buffer to frequency domain
+    // Compute its magnitude at binOffsets
+    std::vector<float> calculateMagnitude(const std::vector<float>& buffer,
+                                          const std::vector<int>& binOffsets) {
+        std::vector<float> fftInput(kNPointFFT);
+        PFFFT_Setup* inputHandle = pffft_new_setup(kNPointFFT, PFFFT_REAL);
+        pffft_transform_ordered(inputHandle, buffer.data(), fftInput.data(), nullptr,
+                                PFFFT_FORWARD);
+        pffft_destroy_setup(inputHandle);
+        std::vector<float> bufferMag(binOffsets.size());
+        for (size_t i = 0; i < binOffsets.size(); i++) {
+            size_t k = binOffsets[i];
+            bufferMag[i] = sqrt((fftInput[k * 2] * fftInput[k * 2]) +
+                                (fftInput[k * 2 + 1] * fftInput[k * 2 + 1]));
+        }
+
+        return bufferMag;
+    }
+
+    // Calculate gain difference between low frequency and high frequency magnitude
+    float calculateGainDiff(const std::vector<float>& inputMag,
+                            const std::vector<float>& outputMag) {
+        std::vector<float> gains(inputMag.size());
+
+        for (size_t i = 0; i < inputMag.size(); i++) {
+            gains[i] = 20 * log10(outputMag[i] / inputMag[i]);
+        }
+
+        return gains[0] - gains[1];
+    }
+
+    static constexpr int kNPointFFT = 32768;
+    static constexpr float kBinWidth = (float)kSamplingFrequency / kNPointFFT;
+    std::set<int> mStrengthValues;
+    int32_t mChannelLayout;
+};
+
+TEST_P(BassBoostDataTest, IncreasingStrength) {
+    // Frequencies to generate multitone input
+    std::vector<int> testFrequencies = {100, 1000};
+
+    // FFT bin indices for testFrequencies
+    std::vector<int> binOffsets(testFrequencies.size());
+
+    std::vector<float> input(kInputSize);
+    std::vector<float> baseOutput(kInputSize);
+
+    std::vector<float> inputMag(testFrequencies.size());
+    float prevGain = -100;
+
+    roundToFreqCenteredToFftBin(testFrequencies, binOffsets);
+
+    generateMultiTone(testFrequencies, input);
+
+    inputMag = calculateMagnitude(input, binOffsets);
+
+    if (isStrengthValid(0)) {
+        ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(0, EX_NONE));
+    } else {
+        GTEST_SKIP() << "Strength not supported, skipping the test\n";
+    }
+
+    ASSERT_NO_FATAL_FAILURE(
+            processAndWriteToOutput(input, baseOutput, mEffect, &mOpenEffectReturn));
+
+    std::vector<float> baseMag(testFrequencies.size());
+    baseMag = calculateMagnitude(baseOutput, binOffsets);
+    float baseDiff = calculateGainDiff(inputMag, baseMag);
+
+    for (int strength : mStrengthValues) {
+        // Skipping the further steps for invalid strength values
+        if (!isStrengthValid(strength)) {
+            continue;
+        }
+
+        ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(strength, EX_NONE));
+
+        std::vector<float> output(kInputSize);
+        std::vector<float> outputMag(testFrequencies.size());
+
+        ASSERT_NO_FATAL_FAILURE(
+                processAndWriteToOutput(input, output, mEffect, &mOpenEffectReturn));
+
+        outputMag = calculateMagnitude(output, binOffsets);
+        float diff = calculateGainDiff(inputMag, outputMag);
+
+        ASSERT_GT(diff, prevGain);
+        ASSERT_GT(diff, baseDiff);
+        prevGain = diff;
+    }
 }
 
 std::vector<std::pair<std::shared_ptr<IFactory>, Descriptor>> kDescPair;

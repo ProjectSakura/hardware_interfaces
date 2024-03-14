@@ -131,9 +131,159 @@ TEST_P(VolumeParamTest, SetAndGetLevel) {
     SetAndGetParameters();
 }
 
-TEST_P(VolumeParamTest, SetAndGetMute) {
-    EXPECT_NO_FATAL_FAILURE(addMuteParam(mParamMute));
-    SetAndGetParameters();
+using VolumeDataTestParam = std::pair<std::shared_ptr<IFactory>, Descriptor>;
+
+class VolumeDataTest : public ::testing::TestWithParam<VolumeDataTestParam>,
+                       public VolumeControlHelper {
+  public:
+    VolumeDataTest() {
+        std::tie(mFactory, mDescriptor) = GetParam();
+        mInput.resize(kBufferSize);
+        mInputMag.resize(mTestFrequencies.size());
+        mBinOffsets.resize(mTestFrequencies.size());
+        roundToFreqCenteredToFftBin(mTestFrequencies, mBinOffsets, kBinWidth);
+        generateMultiTone(mTestFrequencies, mInput, kSamplingFrequency);
+        mInputMag = calculateMagnitude(mInput, mBinOffsets, kNPointFFT);
+    }
+
+    std::vector<int> calculatePercentageDiff(const std::vector<float>& outputMag) {
+        std::vector<int> percentages(mTestFrequencies.size());
+
+        for (size_t i = 0; i < mInputMag.size(); i++) {
+            float diff = mInputMag[i] - outputMag[i];
+            percentages[i] = std::round(diff / mInputMag[i] * 100);
+        }
+        return percentages;
+    }
+
+    // Convert Decibel value to Percentage
+    int percentageDb(float level) { return std::round((1 - (pow(10, level / 20))) * 100); }
+
+    void SetUp() override {
+        SKIP_TEST_IF_DATA_UNSUPPORTED(mDescriptor.common.flags);
+        ASSERT_NO_FATAL_FAILURE(SetUpVolumeControl());
+    }
+    void TearDown() override {
+        SKIP_TEST_IF_DATA_UNSUPPORTED(mDescriptor.common.flags);
+        TearDownVolumeControl();
+    }
+
+    static constexpr int kMaxAudioSample = 1;
+    static constexpr int kTransitionDuration = 300;
+    static constexpr int kNPointFFT = 32768;
+    static constexpr float kBinWidth = (float)kSamplingFrequency / kNPointFFT;
+    static constexpr size_t offset = kSamplingFrequency * kTransitionDuration / 1000;
+    static constexpr float kBaseLevel = 0;
+    std::vector<int> mTestFrequencies = {100, 1000};
+    std::vector<float> mInput;
+    std::vector<float> mInputMag;
+    std::vector<int> mBinOffsets;
+};
+
+TEST_P(VolumeDataTest, ApplyLevelMuteUnmute) {
+    std::vector<float> output(kBufferSize);
+    std::vector<int> diffs(mTestFrequencies.size());
+    std::vector<float> outputMag(mTestFrequencies.size());
+
+    if (!isLevelValid(kBaseLevel)) {
+        GTEST_SKIP() << "Volume Level not supported, skipping the test\n";
+    }
+
+    // Apply Volume Level
+
+    ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(Volume::levelDb, kBaseLevel, EX_NONE));
+    ASSERT_NO_FATAL_FAILURE(processAndWriteToOutput(mInput, output, mEffect, &mOpenEffectReturn));
+
+    outputMag = calculateMagnitude(output, mBinOffsets, kNPointFFT);
+    diffs = calculatePercentageDiff(outputMag);
+
+    for (size_t i = 0; i < diffs.size(); i++) {
+        ASSERT_EQ(diffs[i], percentageDb(kBaseLevel));
+    }
+
+    // Apply Mute
+
+    ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(Volume::mute, true /*mute*/, EX_NONE));
+    ASSERT_NO_FATAL_FAILURE(processAndWriteToOutput(mInput, output, mEffect, &mOpenEffectReturn));
+
+    std::vector<float> subOutputMute(output.begin() + offset, output.end());
+    outputMag = calculateMagnitude(subOutputMute, mBinOffsets, kNPointFFT);
+    diffs = calculatePercentageDiff(outputMag);
+
+    for (size_t i = 0; i < diffs.size(); i++) {
+        ASSERT_EQ(diffs[i], percentageDb(kMinLevel /*Mute*/));
+    }
+
+    // Verifying Fade out
+    outputMag = calculateMagnitude(output, mBinOffsets, kNPointFFT);
+    diffs = calculatePercentageDiff(outputMag);
+
+    for (size_t i = 0; i < diffs.size(); i++) {
+        ASSERT_LT(diffs[i], percentageDb(kMinLevel /*Mute*/));
+    }
+
+    // Apply Unmute
+
+    ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(Volume::mute, false /*unmute*/, EX_NONE));
+    ASSERT_NO_FATAL_FAILURE(processAndWriteToOutput(mInput, output, mEffect, &mOpenEffectReturn));
+
+    std::vector<float> subOutputUnmute(output.begin() + offset, output.end());
+
+    outputMag = calculateMagnitude(subOutputUnmute, mBinOffsets, kNPointFFT);
+    diffs = calculatePercentageDiff(outputMag);
+
+    for (size_t i = 0; i < diffs.size(); i++) {
+        ASSERT_EQ(diffs[i], percentageDb(kBaseLevel));
+    }
+
+    // Verifying Fade in
+    outputMag = calculateMagnitude(output, mBinOffsets, kNPointFFT);
+    diffs = calculatePercentageDiff(outputMag);
+
+    for (size_t i = 0; i < diffs.size(); i++) {
+        ASSERT_GT(diffs[i], percentageDb(kBaseLevel));
+    }
+}
+
+TEST_P(VolumeDataTest, DecreasingLevels) {
+    std::vector<int> decreasingLevels = {-24, -48, -96};
+    std::vector<float> baseOutput(kBufferSize);
+    std::vector<int> baseDiffs(mTestFrequencies.size());
+    std::vector<float> outputMag(mTestFrequencies.size());
+
+    if (!isLevelValid(kBaseLevel)) {
+        GTEST_SKIP() << "Volume Level not supported, skipping the test\n";
+    }
+
+    ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(Volume::levelDb, kBaseLevel, EX_NONE));
+    ASSERT_NO_FATAL_FAILURE(
+            processAndWriteToOutput(mInput, baseOutput, mEffect, &mOpenEffectReturn));
+
+    outputMag = calculateMagnitude(baseOutput, mBinOffsets, kNPointFFT);
+    baseDiffs = calculatePercentageDiff(outputMag);
+
+    for (int level : decreasingLevels) {
+        std::vector<float> output(kBufferSize);
+        std::vector<int> diffs(mTestFrequencies.size());
+
+        // Skipping the further steps for unnsupported level values
+        if (!isLevelValid(level)) {
+            continue;
+        }
+        ASSERT_NO_FATAL_FAILURE(setAndVerifyParameters(Volume::levelDb, level, EX_NONE));
+        ASSERT_NO_FATAL_FAILURE(
+                processAndWriteToOutput(mInput, output, mEffect, &mOpenEffectReturn));
+
+        outputMag = calculateMagnitude(output, mBinOffsets, kNPointFFT);
+        diffs = calculatePercentageDiff(outputMag);
+
+        // Decrease in volume level results in greater magnitude difference
+        for (size_t i = 0; i < diffs.size(); i++) {
+            ASSERT_GT(diffs[i], baseDiffs[i]);
+        }
+
+        baseDiffs = diffs;
+    }
 }
 
 std::vector<std::pair<std::shared_ptr<IFactory>, Descriptor>> kDescPair;
